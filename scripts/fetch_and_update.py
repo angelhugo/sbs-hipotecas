@@ -4,19 +4,12 @@ import requests
 import pandas as pd
 from datetime import date, timedelta
 
-SBS_URL = "https://www.sbs.gob.pe/app/pp/EstadisticasSAEEPortal/Paginas/TIActivaTipoCreditoEmpresa.aspx?tip=B"
+# Endpoint SBS (NO el portal protegido por Incapsula)
+SBS_DAILY_URL = "https://www.sbs.gob.pe/app/stats/TasaDiaria_7B.asp?FECHA_CONSULTA={}"
+
 CSV_PATH = "data/rates.csv"
+WATCH = ["promedio", "bcp", "bbva", "interbank", "scotiabank"]
 
-# Cómo pueden aparecer las columnas en la tabla
-SERIES_COLS = {
-    "promedio": ["Promedio"],
-    "bcp": ["Bancom", "BCP", "Banco de Crédito", "Banco de Credito"],
-    "bbva": ["BBVA"],
-    "interbank": ["Interbank"],
-    "scotiabank": ["Scotiabank"],
-}
-
-TARGET_ROW_TEXT = "Préstamos hipotecarios para vivienda"
 
 def send_telegram(text: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -29,15 +22,17 @@ def send_telegram(text: str):
     r = requests.post(
         url,
         json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
-        timeout=30
+        timeout=30,
     )
     r.raise_for_status()
+
 
 def ensure_csv():
     os.makedirs("data", exist_ok=True)
     if not os.path.exists(CSV_PATH):
         with open(CSV_PATH, "w", encoding="utf-8") as f:
             f.write("date,series,rate\n")
+
 
 def load_csv():
     ensure_csv()
@@ -47,85 +42,125 @@ def load_csv():
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df
 
+
 def save_csv(df):
     out = df.copy()
     out["date"] = out["date"].astype(str)
     out.to_csv(CSV_PATH, index=False)
 
+
 def parse_rate(x) -> float:
     s = str(x).strip().replace("%", "").replace(",", ".")
     return float(s)
 
-def extract_date_from_html(html: str):
-    # La página suele mostrar una fecha DD/MM/AAAA
-    m = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", html)
-    if not m:
-        return date.today()
-    return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
 
-def fetch_latest_sbs():
-    html = requests.get(SBS_URL, timeout=60).text
-    d = extract_date_from_html(html)
+def _fmt_date_for_sbs(d: date) -> str:
+    # DD/MM/YYYY con "/" escapado como %2F
+    return d.strftime("%d/%m/%Y").replace("/", "%2F")
 
-    # Necesita lxml instalado en el workflow
-    tables = pd.read_html(html)
 
-    # Buscar tabla que contenga "Hipotecarios" y la fila target
-    target = None
-    for t in tables:
-        flat = " ".join([str(v) for v in t.values.flatten().tolist()])
-        if "Hipotecarios" in flat and TARGET_ROW_TEXT in flat:
-            target = t
-            break
+def _norm_bank_name(name: str) -> str:
+    """
+    Convierte el texto del banco (tal como aparece en la tabla SBS)
+    al nombre interno de serie: promedio/bcp/bbva/interbank/scotiabank
+    """
+    n = (name or "").strip().upper()
 
-    if target is None:
-        return None
+    if not n or n == "NAN":
+        return ""
 
-    cols = [str(c).strip() for c in target.columns]
-    target.columns = cols
+    # Promedio
+    if "PROMEDIO" in n:
+        return "promedio"
 
-    # encontrar fila
-    row = None
-    for i in range(len(target)):
-        first = str(target.iloc[i, 0])
-        if TARGET_ROW_TEXT in first:
-            row = target.iloc[i]
-            break
+    # BCP (a veces: BANCOM, CRÉDITO, BANCO DE CREDITO, etc.)
+    if "BANCOM" in n or "CREDITO" in n or "CRÉDITO" in n or "BCP" in n:
+        return "bcp"
 
-    if row is None:
-        return None
+    # BBVA
+    if "BBVA" in n:
+        return "bbva"
 
-    rates = {}
-    for series, candidates in SERIES_COLS.items():
-        col = None
-        for cand in candidates:
-            for c in cols:
-                if cand.lower() in c.lower():
-                    col = c
-                    break
-            if col:
-                break
+    # Interbank (a veces: BANCO INTERNACIONAL DEL PERU)
+    if "INTERBANK" in n or "BANCO INTERNACIONAL" in n:
+        return "interbank"
 
-        if not col:
-            continue
+    # Scotiabank
+    if "SCOTIABANK" in n:
+        return "scotiabank"
 
-        val = row[col]
-        sval = str(val).strip()
-        if sval in ("-", "nan", "NaN", ""):
-            continue
+    return ""
+
+
+def fetch_latest_sbs(max_lookback_days: int = 14):
+    """
+    Lee la SBS diaria por fecha (endpoint app/stats).
+    Si hoy no tiene data, retrocede hasta max_lookback_days.
+    Devuelve: {"date": <date>, "rates": {...}, "source_url": <url>}
+    """
+    last_err = None
+
+    for back in range(max_lookback_days):
+        d = date.today() - timedelta(days=back)
+        url = SBS_DAILY_URL.format(_fmt_date_for_sbs(d))
 
         try:
-            rates[series] = parse_rate(val)
-        except:
+            # read_html desde URL
+            tables = pd.read_html(url)
+            if not tables:
+                raise ValueError("No tables found")
+
+            df = tables[0].copy()
+            df.columns = [str(c).strip() for c in df.columns]
+
+            bank_col = df.columns[0]
+
+            # Encontrar columna hipotecaria (encabezado puede variar; buscamos "hipotec")
+            hip_col = None
+            for c in df.columns:
+                if re.search(r"hipotec", c, re.IGNORECASE):
+                    hip_col = c
+                    break
+
+            if hip_col is None:
+                raise ValueError(f"No encontré columna hipotecaria. Columnas: {df.columns.tolist()}")
+
+            rates = {}
+            for _, row in df.iterrows():
+                bank_raw = str(row.get(bank_col, "")).strip()
+                series = _norm_bank_name(bank_raw)
+                if not series:
+                    continue
+
+                val = row.get(hip_col, "")
+                sval = str(val).strip()
+                if sval in ("-", "nan", "NaN", ""):
+                    continue
+
+                try:
+                    rates[series] = parse_rate(val)
+                except:
+                    continue
+
+            # Validación mínima: debe existir promedio
+            if "promedio" not in rates:
+                raise ValueError(f"No vino 'promedio' en {url}. rates={rates}")
+
+            return {"date": d, "rates": rates, "source_url": url}
+
+        except Exception as e:
+            last_err = e
             continue
 
-    if not rates:
-        return None
+    raise RuntimeError(
+        f"No pude obtener data SBS en {max_lookback_days} días. Último error: {last_err}"
+    )
 
-    return {"date": d, "rates": rates}
 
 def upsert(df, d, rates: dict):
-    new = pd.DataFrame([{"date": d, "series": s, "rate": float(r)} for s, r in rates.items()])
+    new = pd.DataFrame(
+        [{"date": d, "series": s, "rate": float(r)} for s, r in rates.items()]
+    )
     if df.empty:
         out = new
     else:
@@ -133,6 +168,7 @@ def upsert(df, d, rates: dict):
         out = out.drop_duplicates(subset=["date", "series"], keep="last")
     out = out.sort_values(["series", "date"]).reset_index(drop=True)
     return out
+
 
 def three_day_down(points):
     # points: [(date, rate)] asc
@@ -142,6 +178,7 @@ def three_day_down(points):
     r0, r1, r2, r3 = [x[1] for x in last4]
     return (r1 < r0) and (r2 < r1) and (r3 < r2)
 
+
 def summarize_last_3(points):
     if len(points) < 3:
         return "Aún no hay 3 datos."
@@ -149,12 +186,17 @@ def summarize_last_3(points):
     b = points[-1]
     delta = b[1] - a[1]
     arrow = "↓" if delta < 0 else ("↑" if delta > 0 else "→")
-    return f"Últimos 3 datos: {a[0]} {a[1]:.2f}% → {b[0]} {b[1]:.2f}% ({arrow} {delta:+.2f} pp)"
+    return (
+        f"Últimos 3 datos: {a[0]} {a[1]:.2f}% → {b[0]} {b[1]:.2f}% "
+        f"({arrow} {delta:+.2f} pp)"
+    )
+
 
 def build_dashboard_url(base_url: str, series: str, days: int = 90):
     to_d = date.today()
     from_d = to_d - timedelta(days=days)
     return f"{base_url}/?series={series}&from={from_d.isoformat()}&to={to_d.isoformat()}"
+
 
 def main():
     base_url = os.environ.get("PUBLIC_BASE_URL", "https://angelhugo.github.io/sbs-hipotecas").rstrip("/")
@@ -162,34 +204,51 @@ def main():
     df = load_csv()
 
     fetched = fetch_latest_sbs()
-    if fetched is None:
-        print("No se pudo leer SBS.")
-        return
+    d = fetched["date"]
+    rates = fetched["rates"]
+    source_url = fetched["source_url"]
 
-    df = upsert(df, fetched["date"], fetched["rates"])
+    df = upsert(df, d, rates)
 
-    # conservar ~400 días
+    # conservar ~400 días (último año + colchón)
     cutoff = date.today() - timedelta(days=400)
     df = df[df["date"] >= cutoff].reset_index(drop=True)
     save_csv(df)
 
-    targets = ["promedio", "bcp", "bbva", "interbank", "scotiabank"]
     alerts = []
-
-    for s in targets:
+    for s in WATCH:
         sdf = df[df["series"] == s].sort_values("date")
         points = list(zip(sdf["date"].tolist(), sdf["rate"].tolist()))
         if three_day_down(points):
             alerts.append((s, points[-1][1], summarize_last_3(points)))
 
     if alerts:
-        lines = ["📉 ALERTA SBS: 3 días seguidos a la baja"]
+        lines = ["📉 ALERTA SBS: 3 días seguidos a la baja", f"Fecha dato: {d}"]
+        # Añadimos valores del día si están
+        def safe_rate(key):
+            return rates.get(key, None)
+
+        daily_parts = []
+        for key, label in [("promedio", "PROMEDIO"), ("bcp", "BCP"), ("bbva", "BBVA"), ("interbank", "INTERBANK"), ("scotiabank", "SCOTIABANK")]:
+            v = safe_rate(key)
+            if v is not None:
+                daily_parts.append(f"{label}: {v:.2f}%")
+        if daily_parts:
+            lines.append(" | ".join(daily_parts))
+
+        lines.append("")  # línea en blanco
+
         for s, last_rate, summary in alerts:
             lines.append(f"- {s.upper()}: {last_rate:.2f}% | {summary}")
             lines.append(f"  Ver evolución: {build_dashboard_url(base_url, s)}")
+
+        lines.append(f"Fuente SBS (día): {source_url}")
+
         send_telegram("\n".join(lines))
     else:
         print("Sin alertas hoy.")
+        print(f"Fuente SBS: {source_url}")
+
 
 if __name__ == "__main__":
     main()
