@@ -3,6 +3,8 @@ import re
 import requests
 import pandas as pd
 from datetime import date, timedelta
+from io import StringIO
+
 
 # Endpoint SBS (NO el portal protegido por Incapsula)
 SBS_DAILY_URL = "https://www.sbs.gob.pe/app/stats/TasaDiaria_7B.asp?FECHA_CONSULTA={}"
@@ -92,69 +94,93 @@ def _norm_bank_name(name: str) -> str:
     return ""
 
 
-def fetch_latest_sbs(max_lookback_days: int = 14):
+def fetch_latest_sbs(max_lookback_days: int = 30):
     """
-    Lee la SBS diaria por fecha (endpoint app/stats).
-    Si hoy no tiene data, retrocede hasta max_lookback_days.
+    Lee la SBS diaria por fecha (endpoint app/stats) usando requests con User-Agent,
+    y parsea las tablas desde el HTML (StringIO). Si hoy no tiene data, retrocede.
     Devuelve: {"date": <date>, "rates": {...}, "source_url": <url>}
     """
     last_err = None
 
+    session = requests.Session()
+    headers = {
+        # “Como navegador” para evitar respuestas raras
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+    }
+
     for back in range(max_lookback_days):
         d = date.today() - timedelta(days=back)
-        url = SBS_DAILY_URL.format(_fmt_date_for_sbs(d))
+        ds = _fmt_date_for_sbs(d)
 
-        try:
-            # read_html desde URL
-            tables = pd.read_html(url)
-            if not tables:
-                raise ValueError("No tables found")
+        # Probamos dos variantes de query (la SBS a veces usa FEC)
+        candidate_urls = [
+            SBS_DAILY_URL.format(ds),  # ...?FECHA_CONSULTA=DD%2FMM%2FYYYY
+            f"https://www.sbs.gob.pe/app/stats/TasaDiaria_7B.asp?FEC={ds}",
+        ]
 
-            df = tables[0].copy()
-            df.columns = [str(c).strip() for c in df.columns]
+        for url in candidate_urls:
+            try:
+                resp = session.get(url, headers=headers, timeout=60)
+                resp.raise_for_status()
+                html = resp.text
 
-            bank_col = df.columns[0]
-
-            # Encontrar columna hipotecaria (encabezado puede variar; buscamos "hipotec")
-            hip_col = None
-            for c in df.columns:
-                if re.search(r"hipotec", c, re.IGNORECASE):
-                    hip_col = c
-                    break
-
-            if hip_col is None:
-                raise ValueError(f"No encontré columna hipotecaria. Columnas: {df.columns.tolist()}")
-
-            rates = {}
-            for _, row in df.iterrows():
-                bank_raw = str(row.get(bank_col, "")).strip()
-                series = _norm_bank_name(bank_raw)
-                if not series:
+                # Si no hay tablas, no hay nada que leer
+                if "<table" not in html.lower():
+                    last_err = ValueError("No tables found (no <table> in HTML)")
                     continue
 
-                val = row.get(hip_col, "")
-                sval = str(val).strip()
-                if sval in ("-", "nan", "NaN", ""):
+                tables = pd.read_html(StringIO(html))  # clave: parsear HTML como contenido
+                if not tables:
+                    last_err = ValueError("No tables found (pandas read_html empty)")
                     continue
 
-                try:
-                    rates[series] = parse_rate(val)
-                except:
+                df = tables[0].copy()
+                df.columns = [str(c).strip() for c in df.columns]
+
+                bank_col = df.columns[0]
+
+                hip_col = None
+                for c in df.columns:
+                    if re.search(r"hipotec", c, re.IGNORECASE):
+                        hip_col = c
+                        break
+                if hip_col is None:
+                    last_err = ValueError(f"No encontré columna hipotecaria. Columnas: {df.columns.tolist()}")
                     continue
 
-            # Validación mínima: debe existir promedio
-            if "promedio" not in rates:
-                raise ValueError(f"No vino 'promedio' en {url}. rates={rates}")
+                rates = {}
+                for _, row in df.iterrows():
+                    bank_raw = str(row.get(bank_col, "")).strip()
+                    series = _norm_bank_name(bank_raw)
+                    if not series:
+                        continue
 
-            return {"date": d, "rates": rates, "source_url": url}
+                    val = row.get(hip_col, "")
+                    sval = str(val).strip()
+                    if sval in ("-", "nan", "NaN", ""):
+                        continue
 
-        except Exception as e:
-            last_err = e
-            continue
+                    try:
+                        rates[series] = parse_rate(val)
+                    except:
+                        continue
+
+                if "promedio" not in rates:
+                    last_err = ValueError(f"No vino 'promedio'. rates={rates}")
+                    continue
+
+                return {"date": d, "rates": rates, "source_url": url}
+
+            except Exception as e:
+                last_err = e
+                continue
 
     raise RuntimeError(
         f"No pude obtener data SBS en {max_lookback_days} días. Último error: {last_err}"
     )
+
 
 
 def upsert(df, d, rates: dict):
