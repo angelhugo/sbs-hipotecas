@@ -1,22 +1,24 @@
-from datetime import date
 import os
+import requests
+from datetime import date
 
-CSV_PATH = "data/rates.csv"
+def send_telegram(text: str):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("No hay TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID.")
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(
+        url,
+        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
+        timeout=30
+    )
+    r.raise_for_status()
 
 def main():
-    today = date.today().isoformat()
-
-    # crear archivo si no existe
-    os.makedirs("data", exist_ok=True)
-    if not os.path.exists(CSV_PATH):
-        with open(CSV_PATH, "w", encoding="utf-8") as f:
-            f.write("date,series,rate\n")
-
-    # escribir una fila de prueba
-    with open(CSV_PATH, "a", encoding="utf-8") as f:
-        f.write(f"{today},test,0.00\n")
-
-    print("Script ejecutado correctamente")
+    send_telegram(f"✅ TEST OK: workflow corrió hoy {date.today().isoformat()} (hora Perú)")
 
 if __name__ == "__main__":
     main()
