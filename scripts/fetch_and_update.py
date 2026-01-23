@@ -126,6 +126,18 @@ def fetch_latest_sbs(max_lookback_days: int = 30):
                 resp.raise_for_status()
                 html = resp.text
 
+                # DEBUG: si no hay tablas, imprime evidencia
+                if "<table" not in html.lower():
+                    snippet = html[:800].replace("\n", " ")
+                    print("DEBUG_NO_TABLE")
+                    print("URL:", url)
+                    print("STATUS:", resp.status_code)
+                    print("FINAL_URL:", resp.url)
+                    print("HEAD_800:", snippet)
+                    last_err = ValueError("No tables found (no <table> in HTML)")
+                    continue
+
+                
                 # Si no hay tablas, no hay nada que leer
                 if "<table" not in html.lower():
                     last_err = ValueError("No tables found (no <table> in HTML)")
