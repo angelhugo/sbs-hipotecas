@@ -22,8 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -U pip
-          pip install pandas requests playwright
-          python -m playwright install --with-deps chromium
+          pip install pandas requests beautifulsoup4 lxml
 
       - name: Run agent (daily)
         env:
