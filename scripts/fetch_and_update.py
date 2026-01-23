@@ -215,43 +215,63 @@ def summarize_last_3_days(points):
     return f"Últimos 3 datos: {d0.isoformat()} {r0:.2f}% → {d2.isoformat()} {r2:.2f}% ({arrow} {delta:+.2f} pp)"
 
 def main():
-    base_url = os.environ.get("PUBLIC_BASE_URL", "https://angelhugo.github.io/sbs-hipotecas").rstrip("/")
+    base_url = os.environ.get(
+        "PUBLIC_BASE_URL",
+        "https://angelhugo.github.io/sbs-hipotecas"
+    ).rstrip("/")
 
     df = load_csv()
 
-    # Intento principal: HOY. Si HOY no tiene dato, probamos AYER, etc. (hasta 5 días atrás).
-    fetched = None
-    for back in range(0, 6):
-        d = date.today() - timedelta(days=back)
-        try:
-            fetched = fetch_for_date(d)
-        except Exception as e:
-            print("Error fetching:", e)
-            fetched = None
-        if fetched is not None:
-            break
-
+    fetched = fetch_latest_from_sbs()
     if fetched is None:
-        print("No se pudo obtener datos recientes desde SBS.")
-        sys.exit(0)
+        print("No pude leer la tabla SBS.")
+        return
 
-    df = upsert_rates(df, fetched["date"], fetched["rates"])
+    df = upsert(df, fetched["date"], fetched["rates"])
 
-    # Mantener al menos 400 días para “último año” con colchón
+    # Mantener ~400 días de histórico
     cutoff = date.today() - timedelta(days=400)
     df = df[df["date"] >= cutoff].reset_index(drop=True)
 
     save_csv(df)
 
-    # Evaluar alertas (promedio y 4 bancos)
-    targets = ["promedio", "bcp", "bbva", "interbank", "scotiabank"]
-alerts = []
+    # 🔹 DEFINICIÓN CORRECTA DE TARGETS
+    targets = [
+        "promedio",
+        "bcp",
+        "bbva",
+        "interbank",
+        "scotiabank",
+    ]
 
-for s in targets:
-    sdf = df[df["series"] == s].sort_values("date")
-    pts = list(zip(sdf["date"].tolist(), sdf["rate"].tolist()))
+    alerts = []
 
-    if three_day_down(pts):
-        last_rate = pts[-1][1]
-        summary = summarize_last_3(pts)
-        alerts.append((s, last_rate, summary))
+    for s in targets:
+        sdf = df[df["series"] == s].sort_values("date")
+        points = list(zip(
+            sdf["date"].tolist(),
+            sdf["rate"].tolist()
+        ))
+
+        if three_day_down(points):
+            last_rate = points[-1][1]
+            summary = summarize_last_3(points)
+            alerts.append((s, last_rate, summary))
+
+    if alerts:
+        lines = ["📉 ALERTA SBS: 3 días seguidos a la baja"]
+        for s, last_rate, summary in alerts:
+            lines.append(
+                f"- {s.upper()}: {last_rate:.2f}% | {summary}"
+            )
+            lines.append(
+                f"  Ver evolución: {build_dashboard_url(base_url, s)}"
+            )
+
+        send_telegram("\n".join(lines))
+    else:
+        print("Sin alertas hoy.")
+
+
+if __name__ == "__main__":
+    main()
