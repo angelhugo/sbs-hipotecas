@@ -245,9 +245,13 @@ def main():
 
     # Evaluar alertas (promedio y 4 bancos)
     targets = ["promedio", "bcp", "bbva", "interbank", "scotiabank"]
-    alerts = []
+alerts = []
 
-    for s in targets:
-        sdf = df[df["series"] == s].sort_values("date")
-        points = list(zip(sdf["date"].tolist(), sdf["rate"].tolist()))
-        if three_day_down(points):
+for s in targets:
+    sdf = df[df["series"] == s].sort_values("date")
+    pts = list(zip(sdf["date"].tolist(), sdf["rate"].tolist()))
+
+    if three_day_down(pts):
+        last_rate = pts[-1][1]
+        summary = summarize_last_3(pts)
+        alerts.append((s, last_rate, summary))
